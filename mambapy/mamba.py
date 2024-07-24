@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mambapy.pscan import pscan
+from mambapy.pscan import pscan, heinsen_pscan
 
 """
 
@@ -49,7 +49,7 @@ class MambaConfig:
     conv_bias: bool = True
     inner_layernorms: bool = False # apply layernorms to internal activations
 
-    pscan: bool = True # use parallel scan mode or sequential mode when training
+    pscan: str = "pscan" # parallel scan (pscan), heinsen pscan (heinsen) or slow sequential (seq)
     use_cuda: bool = False # use official CUDA implementation when training (not compatible with (b)float16)
 
     def __post_init__(self):
@@ -68,7 +68,6 @@ class Mamba(nn.Module):
 
     def forward(self, x):
         # x : (B, L, D)
-
         # y : (B, L, D)
 
         for layer in self.layers:
@@ -255,10 +254,8 @@ class MambaBlock(nn.Module):
             delta = delta.transpose(1, 2)
             delta = F.softplus(delta + self.dt_proj.bias)
 
-            if self.config.pscan:
-                y = self.selective_scan(x, delta, A, B, C, D)
-            else:
-                y = self.selective_scan_seq(x, delta, A, B, C, D)
+            y = self.selective_scan(x, delta, A, B, C, D)
+            
 
         return y
     
@@ -276,40 +273,31 @@ class MambaBlock(nn.Module):
         deltaB = delta.unsqueeze(-1) * B.unsqueeze(2) # (B, L, ED, N)
 
         BX = deltaB * (x.unsqueeze(-1)) # (B, L, ED, N)
+
+        match self.config.pscan: 
+            case "seq": 
+                _, L, _ = x.shape # this is naughty on TPU so only do if needed
+                
+                h = torch.zeros(x.size(0), self.config.d_inner, self.config.d_state, device=deltaA.device) # (B, ED, N)
+                hs = []
         
-        hs = pscan(deltaA, BX)
-
-        y = (hs @ C.unsqueeze(-1)).squeeze(3) # (B, L, ED, N) @ (B, L, N, 1) -> (B, L, ED, 1)
-
-        y = y + D * x
-
-        return y
-    
-    def selective_scan_seq(self, x, delta, A, B, C, D):
-        # x : (B, L, ED)
-        # Δ : (B, L, ED)
-        # A : (ED, N)
-        # B : (B, L, N)
-        # C : (B, L, N)
-        # D : (ED)
-
-        # y : (B, L, ED)
-
-        _, L, _ = x.shape
-
-        deltaA = torch.exp(delta.unsqueeze(-1) * A) # (B, L, ED, N)
-        deltaB = delta.unsqueeze(-1) * B.unsqueeze(2) # (B, L, ED, N)
-
-        BX = deltaB * (x.unsqueeze(-1)) # (B, L, ED, N)
-
-        h = torch.zeros(x.size(0), self.config.d_inner, self.config.d_state, device=deltaA.device) # (B, ED, N)
-        hs = []
-
-        for t in range(0, L):
-            h = deltaA[:, t] * h + BX[:, t]
-            hs.append(h)
+                for t in range(0, L):
+                    h = deltaA[:, t] * h + BX[:, t]
+                    hs.append(h)
+                    
+                hs = torch.stack(hs, dim=1) # (B, L, ED, N)
             
-        hs = torch.stack(hs, dim=1) # (B, L, ED, N)
+            case "pscan": 
+                hs = pscan(deltaA, BX)
+            
+            case "heinsen": 
+                hs = heinsen_pscan( 
+                    deltaA.transpose(1,3), # move L to the end
+                    BX.transpose(1,3)
+                ).transpose(1,3) # move it back
+
+            case "_": 
+                raise ValueError(f"Invalid config.pscan {self.config.pscan} must be seq, pscan or heinsen") 
 
         y = (hs @ C.unsqueeze(-1)).squeeze(3) # (B, L, ED, N) @ (B, L, N, 1) -> (B, L, ED, 1)
 

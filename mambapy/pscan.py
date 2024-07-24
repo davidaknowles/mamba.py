@@ -8,7 +8,31 @@ import torch.nn.functional as F
 An implementation of the parallel scan operation in PyTorch (Blelloch version).
 Please see docs/pscan.ipynb for a detailed explanation of what happens here.
 
+DAKnowles: added Heinsen implementation adapted from 
+https://github.com/johnryan465/pscan/blob/main/src/heinsen.py
+https://arxiv.org/abs/2311.06281
+
 """
+
+def complex_log(X): 
+    X_real = X.abs().log() 
+    X_complex = (X < 0).to(X_real.dtype) # TODO: figure out if accessing dtype is bad on XLA/TPU
+    return torch.complex(X_real, X_complex * torch.pi)
+
+def heinsen_pscan(A, X):
+    # adapted from
+    # https://github.com/johnryan465/pscan/blob/main/src/heinsen.py
+    # A: [...,T] must broadcast with X
+    # X: [...,T]
+    # Calculates:
+    # h[...,t] = A[..., t] * h[...,t] + X[..., t]
+    X_ = complex_log(X)
+    A_ = complex_log(A)
+    a_star = A_.cumsum(dim=-1) # along seq dimension
+    log_x0_plus_b_star = (X_ - a_star).logcumsumexp(dim=-1)
+    log_x =  a_star + log_x0_plus_b_star
+    return log_x.exp().real
+
 
 def npo2(len):
     """
