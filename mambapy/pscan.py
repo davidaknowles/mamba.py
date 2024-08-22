@@ -146,7 +146,7 @@ class PScan(torch.autograd.Function):
         # up sweep (last 2 steps unfolded)
         Aa = A
         Xa = X
-        T = Xa.size(2)
+        T = L
         
         for _ in range(num_steps-2):
             
