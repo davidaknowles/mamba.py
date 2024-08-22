@@ -32,9 +32,11 @@ See Figure 3 of the paper (page 8) for a visual representation of a MambaBlock.
 class MambaConfig:
     d_model: int # D
     n_layers: int
+    L: int # length of x
+    batch_size: int # batchsize
     dt_rank: Union[int, str] = 'auto'
     d_state: int = 16 # N in paper/comments
-    expand_factor: int = 2 # E in paper/comments
+    expand: int = 2 # E in paper/comments
     d_conv: int = 4
 
     dt_min: float = 0.001
@@ -53,7 +55,7 @@ class MambaConfig:
     use_cuda: bool = False # use official CUDA implementation when training (not compatible with (b)float16)
 
     def __post_init__(self):
-        self.d_inner = self.expand_factor * self.d_model # E*D = ED in comments
+        self.d_inner = self.expand * self.d_model # E*D = ED in comments
 
         if self.dt_rank == 'auto':
             self.dt_rank = math.ceil(self.d_model / 16)
@@ -198,14 +200,14 @@ class MambaBlock(nn.Module):
         
         # y : (B, L, D)
 
-        _, L, _ = x.shape
-
+        #_, L, _ = x.shape # TODO poor form on TPU
+            
         xz = self.in_proj(x) # (B, L, 2*ED)
         x, z = xz.chunk(2, dim=-1) # (B, L, ED), (B, L, ED)
 
         # x branch
         x = x.transpose(1, 2) # (B, ED, L)
-        x = self.conv1d(x)[:, :, :L] # depthwise convolution over time, with a short filter
+        x = self.conv1d(x)[:, :, :self.config.L] # depthwise convolution over time, with a short filter
         x = x.transpose(1, 2) # (B, L, ED)
 
         x = F.silu(x)
@@ -256,7 +258,6 @@ class MambaBlock(nn.Module):
 
             y = self.selective_scan(x, delta, A, B, C, D)
             
-
         return y
     
     def selective_scan(self, x, delta, A, B, C, D):
@@ -288,7 +289,7 @@ class MambaBlock(nn.Module):
                 hs = torch.stack(hs, dim=1) # (B, L, ED, N)
             
             case "pscan": 
-                hs = pscan(deltaA, BX)
+                hs = pscan(deltaA, BX, self.config.batch_size, self.config.d_model, self.config.L)
             
             case "heinsen": 
                 hs = heinsen_pscan( 

@@ -15,8 +15,8 @@ https://arxiv.org/abs/2311.06281
 """
 
 def complex_log(X): 
-    X_real = X.abs().log() 
-    X_complex = (X < 0).to(X_real.dtype) # TODO: figure out if accessing dtype is bad on XLA/TPU
+    X_real = X.abs().log() # .to(torch.float64) 
+    X_complex = (X < 0).to(torch.float) # X_real.dtype) # TODO: figure out if accessing dtype is bad on XLA/TPU
     return torch.complex(X_real, X_complex * torch.pi)
 
 def heinsen_pscan(A, X):
@@ -30,18 +30,31 @@ def heinsen_pscan(A, X):
     A_ = complex_log(A)
     a_star = A_.cumsum(dim=-1) # along seq dimension
     log_x0_plus_b_star = (X_ - a_star).logcumsumexp(dim=-1)
-    log_x =  a_star + log_x0_plus_b_star
-    return log_x.exp().real
+    log_x = a_star + log_x0_plus_b_star
+    return log_x.exp().real # .float()
 
+def naive(A, X): 
+    # Same interface as heinsen_pscan
+    X_shape = X.shape
+    L = X_shape[-1]
+    
+    h = torch.zeros(X_shape[:-1], device = X.device) 
+    hs = []
 
-def npo2(len):
+    for t in range(0, L):
+        h = A[..., t] * h + X[..., t]
+        hs.append(h)
+    
+    return torch.stack(hs, dim=-1) 
+
+def npo2(L):
     """
     Returns the next power of 2 above len
     """
 
-    return 2 ** math.ceil(math.log2(len))
+    return 2 ** math.ceil(math.log2(L))
 
-def pad_npo2(X):
+def pad_npo2(X, L):
     """
     Pads input length dim to the next power of 2
 
@@ -52,13 +65,13 @@ def pad_npo2(X):
         Y : (B, npo2(L), D, N)
     """
 
-    len_npo2 = npo2(X.size(1))
-    pad_tuple = (0, 0, 0, 0, 0, len_npo2 - X.size(1))
+    len_npo2 = npo2(L)
+    pad_tuple = (0, 0, 0, 0, 0, len_npo2 - L)
     return F.pad(X, pad_tuple, "constant", 0)
 
 class PScan(torch.autograd.Function):
     @staticmethod
-    def pscan(A, X):
+    def pscan(A, X, B, D, L): 
         # A : (B, D, L, N)
         # X : (B, D, L, N)
 
@@ -69,14 +82,15 @@ class PScan(torch.autograd.Function):
 
         # only supports L that is a power of two (mainly for a clearer code)
         
-        B, D, L, _ = A.size()
         num_steps = int(math.log2(L))
 
         # up sweep (last 2 steps unfolded)
         Aa = A
         Xa = X
+
+        T = L
+        
         for _ in range(num_steps-2):
-            T = Xa.size(2)
             Aa = Aa.view(B, D, T//2, 2, -1)
             Xa = Xa.view(B, D, T//2, 2, -1)
             
@@ -85,14 +99,15 @@ class PScan(torch.autograd.Function):
 
             Aa = Aa[:, :, :, 1]
             Xa = Xa[:, :, :, 1]
+            T = T // 2
 
         # we have only 4, 2 or 1 nodes left
-        if Xa.size(2) == 4:
+        if T == 4:
             Xa[:, :, 1].add_(Aa[:, :, 1].mul(Xa[:, :, 0]))
             Aa[:, :, 1].mul_(Aa[:, :, 0])
 
             Xa[:, :, 3].add_(Aa[:, :, 3].mul(Xa[:, :, 2] + Aa[:, :, 2].mul(Xa[:, :, 1])))
-        elif Xa.size(2) == 2:
+        elif T == 2:
             Xa[:, :, 1].add_(Aa[:, :, 1].mul(Xa[:, :, 0]))
             return
         else:
@@ -108,7 +123,7 @@ class PScan(torch.autograd.Function):
             Aa = A[:, :, 2**k-1:L:2**k]
             Xa = X[:, :, 2**k-1:L:2**k]
 
-            T = Xa.size(2)
+            T = L // 2**k
             Aa = Aa.view(B, D, T//2, 2, -1)
             Xa = Xa.view(B, D, T//2, 2, -1)
 
@@ -116,7 +131,7 @@ class PScan(torch.autograd.Function):
             Aa[:, :, 1:, 0].mul_(Aa[:, :, :-1, 1])
 
     @staticmethod
-    def pscan_rev(A, X):
+    def pscan_rev(A, X, B, D, L):
         # A : (B, D, L, N)
         # X : (B, D, L, N)
 
@@ -126,14 +141,15 @@ class PScan(torch.autograd.Function):
 
         # only supports L that is a power of two (mainly for a clearer code)
 
-        B, D, L, _ = A.size()
         num_steps = int(math.log2(L))
 
         # up sweep (last 2 steps unfolded)
         Aa = A
         Xa = X
+        T = Xa.size(2)
+        
         for _ in range(num_steps-2):
-            T = Xa.size(2)
+            
             Aa = Aa.view(B, D, T//2, 2, -1)
             Xa = Xa.view(B, D, T//2, 2, -1)
                     
@@ -142,14 +158,15 @@ class PScan(torch.autograd.Function):
 
             Aa = Aa[:, :, :, 0]
             Xa = Xa[:, :, :, 0]
+            T = T // 2
 
         # we have only 4, 2 or 1 nodes left
-        if Xa.size(2) == 4:
+        if T == 4:
             Xa[:, :, 2].add_(Aa[:, :, 2].mul(Xa[:, :, 3]))
             Aa[:, :, 2].mul_(Aa[:, :, 3])
 
             Xa[:, :, 0].add_(Aa[:, :, 0].mul(Xa[:, :, 1].add(Aa[:, :, 1].mul(Xa[:, :, 2]))))
-        elif Xa.size(2) == 2:
+        elif T == 2:
             Xa[:, :, 0].add_(Aa[:, :, 0].mul(Xa[:, :, 1]))
             return
         else:
@@ -165,7 +182,7 @@ class PScan(torch.autograd.Function):
             Aa = A[:, :, 0:L:2**k]
             Xa = X[:, :, 0:L:2**k]
 
-            T = Xa.size(2)
+            T = L // 2**k + 1
             Aa = Aa.view(B, D, T//2, 2, -1)
             Xa = Xa.view(B, D, T//2, 2, -1)
 
@@ -173,7 +190,7 @@ class PScan(torch.autograd.Function):
             Aa[:, :, :-1, 1].mul_(Aa[:, :, 1:, 0])
 
     @staticmethod
-    def forward(ctx, A_in, X_in):
+    def forward(ctx, A_in, X_in, B, D, L):
         """
         Applies the parallel scan operation, as defined above. Returns a new tensor.
         If you can, privilege sequence lengths that are powers of two.
@@ -186,25 +203,27 @@ class PScan(torch.autograd.Function):
             H : (B, L, D, N)
         """
 
-        L = X_in.size(1)
-
         # cloning is requiered because of the in-place ops
         if L == npo2(L):
             A = A_in.clone()
             X = X_in.clone()
         else:
             # pad tensors (and clone btw)
-            A = pad_npo2(A_in) # (B, npo2(L), D, N)
-            X = pad_npo2(X_in) # (B, npo2(L), D, N)
+            A = pad_npo2(A_in, L) # (B, npo2(L), D, N)
+            X = pad_npo2(X_in, L) # (B, npo2(L), D, N)
         
         # prepare tensors
         A = A.transpose(2, 1) # (B, D, npo2(L), N)
         X = X.transpose(2, 1) # (B, D, npo2(L), N)
 
         # parallel scan (modifies X in-place)
-        PScan.pscan(A, X)
+        PScan.pscan(A, X, B, D, L)
 
-        ctx.save_for_backward(A_in, X)
+        ctx.save_for_backward(A_in, X) 
+        
+        ctx.B = B
+        ctx.D = D
+        ctx.L = L
         
         # slice [:, :L] (cut if there was padding)
         return X.transpose(2, 1)[:, :L]
@@ -222,9 +241,10 @@ class PScan(torch.autograd.Function):
             gradA : (B, L, D, N), gradX : (B, L, D, N)
         """
 
-        A_in, X = ctx.saved_tensors
-
-        L = grad_output_in.size(1)
+        A_in, X,  = ctx.saved_tensors
+        B = ctx.B
+        D = ctx.D
+        L = ctx.L
 
         # cloning is requiered because of the in-place ops
         if L == npo2(L):
@@ -240,11 +260,11 @@ class PScan(torch.autograd.Function):
         A = torch.nn.functional.pad(A_in[:, :, 1:], (0, 0, 0, 1)) # (B, D, npo2(L), N) shift 1 to the left (see hand derivation)
 
         # reverse parallel scan (modifies grad_output in-place)
-        PScan.pscan_rev(A, grad_output)
+        PScan.pscan_rev(A, grad_output, B, D, L)
 
         Q = torch.zeros_like(X)
         Q[:, :, 1:].add_(X[:, :, :-1] * grad_output[:, :, 1:])
 
-        return Q.transpose(2, 1)[:, :L], grad_output.transpose(2, 1)[:, :L]
+        return Q.transpose(2, 1)[:, :L], grad_output.transpose(2, 1)[:, :L], None, None, None
     
 pscan = PScan.apply
