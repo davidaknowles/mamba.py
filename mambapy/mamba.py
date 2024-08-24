@@ -8,6 +8,8 @@ import torch.nn.functional as F
 
 from mambapy.pscan import pscan, heinsen_pscan
 
+import mambapy.pscan_og
+
 """
 
 This file closely follows the mamba_simple.py from the official Mamba implementation, and the mamba-minimal by @johnma2006.
@@ -270,10 +272,15 @@ class MambaBlock(nn.Module):
 
         # y : (B, L, ED)
 
+        # self.config.d_inner == ED == d_model * expand
+        # self.config.d_model == D
+
         deltaA = torch.exp(delta.unsqueeze(-1) * A) # (B, L, ED, N)
         deltaB = delta.unsqueeze(-1) * B.unsqueeze(2) # (B, L, ED, N)
 
         BX = deltaB * (x.unsqueeze(-1)) # (B, L, ED, N)
+
+        ED = self.config.d_model * self.config.expand
 
         match self.config.pscan: 
             case "seq": 
@@ -289,8 +296,11 @@ class MambaBlock(nn.Module):
                 hs = torch.stack(hs, dim=1) # (B, L, ED, N)
             
             case "pscan": 
-                hs = pscan(deltaA, BX, self.config.batch_size, self.config.d_model, self.config.L)
-            
+                hs = pscan(deltaA, BX, self.config.batch_size, self.config.d_inner, self.config.L)
+
+            case "pscan_og": 
+                hs = mambapy.pscan_og.pscan(deltaA, BX) # , self.config.batch_size, self.config.d_inner, self.config.L)
+
             case "heinsen": 
                 hs = heinsen_pscan( 
                     deltaA.transpose(1,3), # move L to the end
